@@ -42,6 +42,12 @@ PRETRAINED_MODEL_ARCHIVE_MAP = {"gpt2": "https://s3.amazonaws.com/models.hugging
 PRETRAINED_CONFIG_ARCHIVE_MAP = {"gpt2": "https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-config.json",
                                  "gpt2-medium": "https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-medium-config.json"}
 
+def custom_loss(data, targets):  #data=predictions, target = groundtruth
+    ''' Define custom loss function for weighted BCE on 'target' column '''
+    bce_loss_1 = nn.BCEWithLogitsLoss(weight=targets[:,1:2])(data[:,:1],targets[:,:1]) #target
+    bce_loss_2 = nn.BCEWithLogitsLoss()(data[:,2:],targets[:,2:]) #aux targets
+    return (bce_loss_1 * loss_weight) + bce_loss_2
+
 def prune_conv1d_layer(layer, index, dim=1):
     """ Prune a Conv1D layer (a model parameters) to keep only entries in index.
         A Conv1D work as a Linear layer (see e.g. BERT) but the weights are transposed.
@@ -970,27 +976,29 @@ class GPTClassificationHead(nn.Module):
         logits = self.linear(self.dropout(h_conc))
         return logits
 
-class GPT2ClassificationHeadModelTwo(GPT2PreTrainedModel):
+# # class GPT2ClassificationHeadModelTwo(GPT2PreTrainedModel):
 
-    def __init__(self, config):
-        super(GPT2ClassificationHeadModelTwo, self).__init__(config)
-        self.transformer = GPT2Model(config)
-        self.classifier_head = GPTClassificationHead(config)
-        self.apply(self.init_weights)
+# #     def __init__(self, config):
+# #         super(GPT2ClassificationHeadModelTwo, self).__init__(config)
+# #         self.transformer = GPT2Model(config, output_attentions=False, 
+# #                                              keep_multihead_output=False)
+# #         self.classifier_head = GPTClassificationHead(config)
+# #         self.apply(self.init_weights)
     
-    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None):
-        hidden_states, presents = self.transformer(input_ids, position_ids,
-            token_type_ids, past)
-        logits = self.classifier_head(hidden_states)
+#     def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None):
+#         hidden_states, presents = self.transformer(input_ids, position_ids,
+#             token_type_ids, past)
+#         logits = self.classifier_head(hidden_states)
 
-        return logits
+#         return logits
 
 # for kaggle jigsaw might be redundant
 class GPT2ClassificationHeadModel(GPT2PreTrainedModel):
 
-    def __init__(self, config, clf_dropout=0.4, n_class=8):
+    def __init__(self, config, clf_dropout=0.4, n_class=8, output_attentions=False, keep_mulithead_output=False):
         super(GPT2ClassificationHeadModel, self).__init__(config)
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2Model(config, output_attentions=output_attentions,
+                                             keep_multihead_output=keep_mulithead_output)
         self.dropout = nn.Dropout(clf_dropout)
         self.linear = nn.Linear(config.n_embd * 2, n_class)
 
@@ -999,33 +1007,54 @@ class GPT2ClassificationHeadModel(GPT2PreTrainedModel):
         
         self.apply(self.init_weights)
 
+    def set_num_special_tokens(self, num_special_tokens, predict_special_tokens=True):
+        self.config.predict_special_tokens = self.transformer.config.predict_special_tokens = predict_special_tokens
+        self.transformer.set_num_special_tokens(num_special_tokens)
 
-    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None):
-        hidden_states, presents = self.transformer(input_ids, position_ids, token_type_ids, past)
+    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None, head_mask=None):
+        transformer_output = self.transfomer(input_ids, position_ids, token_type_ids, past, head_mask)
+        if self.transformer.output_attentions:
+            all_attentions, hidden_states, presents = transformer_output
+        else:
+            hidden_states, presents = transformer_output
+        hidden_states = hidden_states[-1]
         avg_pool = torch.mean(hidden_states, 1)
         max_pool, _ = torch.max(hidden_states, 1)
         h_conc = torch.cat((avg_pool, max_pool), 1)
         logits = self.linear(self.dropout(h_conc))
+        if self.transformer.output_attentions:
+            return all_attentions, logits, presents
         return logits
 
 
 class GPT2MultiTaskJigsaw(GPT2PreTrainedModel):
 
-    def __init__(self, config, clf_dropout=0.4, n_class=8):
+    def __init__(self, config, clf_dropout=0.4, n_class=8, output_attentions=False, keep_multihead_output=False):
         super(GPT2MultiTaskJigsaw, self).__init__(config)
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2Model(config, output_attentions=output_attentions,
+                                             keep_multihead_output=keep_multihead_output)
         self.lm_head = GPT2LMHead(self.transformer.wte.weight, config)
         self.classifier_head = GPTClassificationHead(config, n_class=n_class)
         self.apply(self.init_weights)
-        self.set_tied()
 
-    def set_tied(self):
-        """ Share the embeddings between LM and transformer
+
+    def set_num_special_tokens(self, num_special_tokens, predict_special_tokens=True):
+        """ Update input and output embeddings with new embedding matrice
+            Make sure we are sharing the embeddings
         """
-        self.lm_head.set_embeddings_weights(self.transformer.wte.weight)
+        self.config.predict_special_tokens = self.transformer.config.predict_special_tokens = predict_special_tokens
+        self.transformer.set_num_special_tokens(num_special_tokens)
+        self.lm_head.set_embeddings_weights(self.transformer.wte.weight, predict_special_tokens=predict_special_tokens)
 
-    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, clf_labels=None, past=None):
-        hidden_states, presents = self.transformer(input_ids, position_ids, token_type_ids, past)
+    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, clf_labels=None, 
+                past=None, head_mask=None):
+        transformer_output = self.transformer(input_ids, position_ids, token_type_ids, past, head_mask)
+        if self.transformer.output_attentions:
+            all_attentions, hidden_states, presents = transformer_output
+        else:
+            hidden_states, presents = transformer_output
+        hidden_states = hidden_states[-1]
+
         lm_logits = self.lm_head(hidden_states)
         clf_logits = self.classifier_head(hidden_states)
         losses = []
@@ -1036,14 +1065,17 @@ class GPT2MultiTaskJigsaw(GPT2PreTrainedModel):
             loss_fct = CrossEntropyLoss(ignore_index=-1)
             losses.append(loss_fct(shift_logits.view(-1,
                           shift_logits.size(-1)), shift_labels.view(-1)))
-       
         if clf_labels is not None:
-            loss_fct = BCEWithLogitsLoss()
-            #losses.append(loss_fct(clf_logits.view(-1, clf_logits.size(-1)), clf_labels.view(-1)))
-            losses.append(loss_fct(clf_logits, clf_labels))
-
+            num_targets = clf_labels.size()[1]
+            if num_targets >= 7:
+                losses.append(custom_loss(clf_logits, clf_labels))
+            else:  
+                loss_fct = BCEWithLogitsLoss()
+                #losses.append(loss_fct(clf_logits.view(-1, clf_logits.size(-1)), clf_labels.view(-1)))
+                losses.append(loss_fct(clf_logits, clf_labels))
         if losses:
             return(lm_logits, clf_logits), losses
-
-        return lm_logits, clf_logits
+        if self.transformer.output_attentions:
+            return all_attentions, lm_logits, clf_logits, presents
+        return lm_logits, clf_logits, presents
 
