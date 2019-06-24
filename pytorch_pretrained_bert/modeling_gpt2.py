@@ -29,6 +29,7 @@ from io import open
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+from torch.nn import BCEWithLogitsLoss
 from torch.nn.parameter import Parameter
 
 from .file_utils import cached_path, CONFIG_NAME, WEIGHTS_NAME
@@ -947,3 +948,102 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
         if self.transformer.output_attentions:
             return all_attentions, lm_logits, mc_logits, presents
         return lm_logits, mc_logits, presents
+
+
+
+class GPTClassificationHead(nn.Module):
+    "Classifier head for jigsaw kaggle"
+
+    def __init__(self, config, clf_dropout=0.4, n_class=8):
+        super(GPTClassificationHead, self).__init__()
+        self.n_embd = config.n_embd * 2
+        self.dropout = nn.Dropout(clf_dropout)
+        self.linear = nn.Linear(config.n_embd * 2, n_class)
+
+        nn.init.normal_(self.linear.weight, std=0.02)
+        nn.init.normal_(self.linear.bias, 0)
+
+    def forward(self, hidden_states):
+        avg_pool = torch.mean(hidden_states, 1)
+        max_pool, _ = torch.max(hidden_states, 1)
+        h_conc = torch.cat((avg_pool, max_pool), 1)
+        logits = self.linear(self.dropout(h_conc))
+        return logits
+
+class GPT2ClassificationHeadModelTwo(GPT2PreTrainedModel):
+
+    def __init__(self, config):
+        super(GPT2ClassificationHeadModelTwo, self).__init__(config)
+        self.transformer = GPT2Model(config)
+        self.classifier_head = GPTClassificationHead(config)
+        self.apply(self.init_weights)
+    
+    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None):
+        hidden_states, presents = self.transformer(input_ids, position_ids,
+            token_type_ids, past)
+        logits = self.classifier_head(hidden_states)
+
+        return logits
+
+# for kaggle jigsaw might be redundant
+class GPT2ClassificationHeadModel(GPT2PreTrainedModel):
+
+    def __init__(self, config, clf_dropout=0.4, n_class=8):
+        super(GPT2ClassificationHeadModel, self).__init__(config)
+        self.transformer = GPT2Model(config)
+        self.dropout = nn.Dropout(clf_dropout)
+        self.linear = nn.Linear(config.n_embd * 2, n_class)
+
+        nn.init.normal_(self.linear.weight, std = 0.02)
+        nn.init.normal_(self.linear.bias, 0)
+        
+        self.apply(self.init_weights)
+
+
+    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None):
+        hidden_states, presents = self.transformer(input_ids, position_ids, token_type_ids, past)
+        avg_pool = torch.mean(hidden_states, 1)
+        max_pool, _ = torch.max(hidden_states, 1)
+        h_conc = torch.cat((avg_pool, max_pool), 1)
+        logits = self.linear(self.dropout(h_conc))
+        return logits
+
+
+class GPT2MultiTaskJigsaw(GPT2PreTrainedModel):
+
+    def __init__(self, config, clf_dropout=0.4, n_class=8):
+        super(GPT2MultiTaskJigsaw, self).__init__(config)
+        self.transformer = GPT2Model(config)
+        self.lm_head = GPT2LMHead(self.transformer.wte.weight, config)
+        self.classifier_head = GPTClassificationHead(config, n_class=n_class)
+        self.apply(self.init_weights)
+        self.set_tied()
+
+    def set_tied(self):
+        """ Share the embeddings between LM and transformer
+        """
+        self.lm_head.set_embeddings_weights(self.transformer.wte.weight)
+
+    def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, clf_labels=None, past=None):
+        hidden_states, presents = self.transformer(input_ids, position_ids, token_type_ids, past)
+        lm_logits = self.lm_head(hidden_states)
+        clf_logits = self.classifier_head(hidden_states)
+        losses = []
+
+        if lm_labels is not None:
+            shift_logits = lm_logits[:, :-1].contiguous()
+            shift_labels =  lm_labels[:, 1:].contiguous()
+            loss_fct = CrossEntropyLoss(ignore_index=-1)
+            losses.append(loss_fct(shift_logits.view(-1,
+                          shift_logits.size(-1)), shift_labels.view(-1)))
+       
+        if clf_labels is not None:
+            loss_fct = BCEWithLogitsLoss()
+            #losses.append(loss_fct(clf_logits.view(-1, clf_logits.size(-1)), clf_labels.view(-1)))
+            losses.append(loss_fct(clf_logits, clf_labels))
+
+        if losses:
+            return(lm_logits, clf_logits), losses
+
+        return lm_logits, clf_logits
+
