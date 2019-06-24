@@ -1012,7 +1012,7 @@ class GPT2ClassificationHeadModel(GPT2PreTrainedModel):
         self.transformer.set_num_special_tokens(num_special_tokens)
 
     def forward(self, input_ids, position_ids=None, token_type_ids=None, lm_labels=None, past=None, head_mask=None):
-        transformer_output = self.transfomer(input_ids, position_ids, token_type_ids, past, head_mask)
+        transformer_output = self.transformer(input_ids, position_ids, token_type_ids, past, head_mask)
         if self.transformer.output_attentions:
             all_attentions, hidden_states, presents = transformer_output
         else:
@@ -1028,7 +1028,7 @@ class GPT2ClassificationHeadModel(GPT2PreTrainedModel):
 
 
 class GPT2MultiTaskJigsaw(GPT2PreTrainedModel):
-
+    #how to get the loss weights intit
     def __init__(self, config, clf_dropout=0.4, n_class=8, output_attentions=False, keep_multihead_output=False):
         super(GPT2MultiTaskJigsaw, self).__init__(config)
         self.transformer = GPT2Model(config, output_attentions=output_attentions,
